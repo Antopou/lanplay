@@ -1,0 +1,132 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #0b0d10;
+  color: #e6e8ea;
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "SF Pro Text", sans-serif;
+  overflow: hidden;
+}
+
+/* The canvas carries the stream's own pixel dimensions as attributes, so capping
+   both axes at 100% scales it down while keeping its aspect ratio -- letterboxing
+   falls out of the centring flexbox for free. */
+#stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#screen {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  background: #000;
+  touch-action: none;
+}
+
+#bar {
+  position: fixed;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 8px 14px;
+  white-space: nowrap;
+  background: rgba(19, 22, 27, 0.88);
+  border: 1px solid #272c35;
+  border-radius: 11px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(14px);
+  transition: opacity 0.22s ease;
+}
+/* While input is captured the bar would only get in the way -- and must not eat
+   clicks meant for the remote screen. */
+body.capturing #bar { opacity: 0; pointer-events: none; }
+
+#bar label { display: flex; align-items: center; gap: 6px; color: #99a2ae; }
+#bar .sep { width: 1px; height: 18px; background: #2b313a; }
+#bar .check { cursor: pointer; }
+
+#dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; flex: none; }
+#dot.on { background: #34d399; }
+#dot.wait { background: #fbbf24; }
+#dot.off { background: #f87171; }
+
+#hud {
+  min-width: 172px;
+  color: #8b94a1;
+  font-variant-numeric: tabular-nums;
+}
+
+button {
+  font: inherit;
+  color: #e6e8ea;
+  background: #222831;
+  border: 1px solid #333b46;
+  border-radius: 7px;
+  padding: 5px 11px;
+  cursor: pointer;
+}
+button:hover { background: #2b323d; }
+button.active { background: #1d4ed8; border-color: #2563eb; color: #fff; }
+
+select, input[type="text"], #pin {
+  font: inherit;
+  color: #e6e8ea;
+  background: #1a1f26;
+  border: 1px solid #333b46;
+  border-radius: 7px;
+  padding: 4px 7px;
+}
+input[type="range"] { width: 92px; accent-color: #3b82f6; }
+
+#gate {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 10, 13, 0.95);
+  backdrop-filter: blur(7px);
+}
+body.connected #gate { display: none; }
+
+#gateform {
+  width: min(360px, 88vw);
+  text-align: center;
+  padding: 30px 28px;
+  background: #12161c;
+  border: 1px solid #242a33;
+  border-radius: 15px;
+}
+#gateform h1 { margin: 0 0 6px; font-size: 21px; letter-spacing: -0.01em; }
+#gatemsg { margin: 0 0 18px; color: #98a1ad; }
+#gate.error #gatemsg { color: #fca5a5; }
+
+#pin {
+  width: 100%;
+  margin-bottom: 11px;
+  padding: 11px;
+  font-size: 25px;
+  text-align: center;
+  letter-spacing: 0.32em;
+  font-variant-numeric: tabular-nums;
+}
+#gateform button { width: 100%; padding: 10px; background: #1d4ed8; border-color: #2563eb; }
+#gateform button:hover { background: #2563eb; }
+
+.hint { margin: 18px 0 0; color: #6b7480; font-size: 12px; line-height: 1.6; }
+kbd {
+  padding: 1px 5px;
+  background: #1a1f26;
+  border: 1px solid #333b46;
+  border-radius: 4px;
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+}

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>LANplay</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="screen" width="1280" height="720"></canvas>
+</div>
+
+<div id="bar">
+  <span id="dot" class="off" title="connection"></span>
+  <span id="hud">connecting</span>
+  <span class="sep"></span>
+  <label>quality <input id="quality" type="range" min="20" max="95" step="5" value="65"></label>
+  <label>size
+    <select id="height">
+      <option value="720">720p</option>
+      <option value="900" selected>900p</option>
+      <option value="1080">1080p</option>
+      <option value="0">native</option>
+    </select>
+  </label>
+  <label class="check"><input id="meta" type="checkbox"> Cmd&nbsp;=&nbsp;Win</label>
+  <span class="sep"></span>
+  <button id="grab">Capture input</button>
+  <button id="full">Fullscreen</button>
+</div>
+
+<div id="gate">
+  <form id="gateform">
+    <h1>LANplay</h1>
+    <p id="gatemsg">Enter the PIN shown in the terminal on the other laptop.</p>
+    <input id="pin" inputmode="numeric" autocomplete="off" spellcheck="false"
+           maxlength="12" placeholder="000000">
+    <button type="submit">Connect</button>
+    <p class="hint">Click the screen to send keys to the other machine.
+       <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd> gives them back.</p>
+  </form>
+</div>
+
+<script src="/static/viewer.js"></script>
+</body>
+</html>
