@@ -250,6 +250,12 @@ async def _handle_input(
         if "meta" in data:
             injector.meta_as_ctrl = bool(data["meta"])
 
+    elif kind == "refresh":
+        # The viewer lost an update (a failed decode, a resize landing on partial
+        # tiles) and cannot repair itself from incremental data. Cheaper than
+        # making it wait out --refresh with a hole on screen.
+        encoder.configure()
+
     elif kind == "ack":
         pacer.ack(int(data.get("n", 0)))
 

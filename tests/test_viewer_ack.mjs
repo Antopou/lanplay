@@ -5,10 +5,10 @@
  * cannot see: the host stops after two un-acked frames, so a viewer that fails to
  * ack does not degrade -- it freezes solid after two frames.
  *
- * The subtle part being pinned down is that frames are counted on *arrival* while
- * the ack is sent after *drawing*. A frame superseded before it could be decoded is
- * never drawn, and if it were not counted its credit would never come back and the
- * stream would wedge.
+ * The subtle part being pinned down is that updates are counted on *arrival* while
+ * the ack is sent after *drawing*. It also checks that no update is ever dropped:
+ * updates are incremental now, so the old keep-only-the-newest behaviour would
+ * leave stale pixels on the canvas until the next full refresh.
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -28,11 +28,12 @@ const check = (label, cond, detail = '') => {
 const sent = [];            // every JSON message the viewer emits
 let sockets = [];           // every WebSocket it opens
 let decodeFails = false;
+let draws = 0;             // every tile the viewer paints
 
 const el = () => ({
   classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
   addEventListener() {}, focus() {}, select() {}, blur() {},
-  getContext: () => ({ drawImage() {} }),
+  getContext: () => ({ drawImage() { draws++; } }),
   getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 450 }),
   textContent: '', value: '65', checked: false, width: 0, height: 0, className: '',
 });
@@ -69,7 +70,21 @@ const ctx = vm.createContext({
 });
 vm.runInContext(src, ctx);
 
-const frame = () => new Uint8Array([0, 0, 0, 0, 4, 0, 3, 0, 0xff, 0xd8]).buffer;
+// One update carrying a single 4x3 tile at the origin, in the real wire format:
+// [u16 count][u16 sw][u16 sh] then [u16 x][u16 y][u16 w][u16 h][u32 len][jpeg]
+const frame = (count = 1) => {
+  const jpeg = [0xff, 0xd8, 0xff, 0xd9];
+  const buf = new ArrayBuffer(6 + count * (12 + jpeg.length));
+  const dv = new DataView(buf);
+  dv.setUint16(0, count, true); dv.setUint16(2, 4, true); dv.setUint16(4, 3, true);
+  for (let i = 0, at = 6; i < count; i++, at += 12 + jpeg.length) {
+    dv.setUint16(at, 0, true); dv.setUint16(at + 2, 0, true);
+    dv.setUint16(at + 4, 4, true); dv.setUint16(at + 6, 3, true);
+    dv.setUint32(at + 8, jpeg.length, true);
+    new Uint8Array(buf, at + 12, jpeg.length).set(jpeg);
+  }
+  return buf;
+};
 const settle = () => new Promise((r) => setTimeout(r, 20));
 const acks = () => sent.filter((m) => m.t === 'ack');
 const lastAck = () => acks().at(-1);
@@ -82,29 +97,42 @@ ws.onopen();
 ws.onmessage({ data: JSON.stringify({ t: 'ready', w: 1280, h: 720 }) });
 check('no ack before any frame arrives', acks().length === 0);
 
-// One frame, drawn and acknowledged.
+// One update, drawn and acknowledged.
+draws = 0;
 ws.onmessage({ data: frame() });
 await settle();
-check('a drawn frame is acknowledged', lastAck()?.n === 1, JSON.stringify(lastAck()));
+check('a drawn update is acknowledged', lastAck()?.n === 1, JSON.stringify(lastAck()));
+check('its tile is painted', draws === 1, `${draws} draw(s)`);
 
-// Three back-to-back. The middle one is superseded before it can be decoded and is
-// never drawn -- but it must still be counted, or the host loses a credit forever.
-ws.onmessage({ data: frame() });
-ws.onmessage({ data: frame() });
-ws.onmessage({ data: frame() });
+// A multi-tile update must paint every rectangle it carries.
+draws = 0;
+ws.onmessage({ data: frame(5) });
 await settle();
-check('a superseded frame still returns its credit', lastAck()?.n === 4,
-      `${JSON.stringify(lastAck())} after 4 frames total`);
+check('every tile of an update is painted', draws === 5, `${draws} draw(s)`);
+
+// Three back-to-back, arriving while the first is still decoding. None may be
+// dropped: an update is a patch now, so skipping one leaves the canvas stale.
+draws = 0;
+ws.onmessage({ data: frame(2) });
+ws.onmessage({ data: frame(2) });
+ws.onmessage({ data: frame(2) });
+await settle();
+check('a queued update is never dropped', draws === 6, `${draws} of 6 tiles drawn`);
+check('all three are acknowledged', lastAck()?.n === 5,
+      `${JSON.stringify(lastAck())} after 5 updates total`);
 
 // A decode failure must not strand the credit either.
 decodeFails = true;
+sent.length = 0;
 ws.onmessage({ data: frame() });
 await settle();
 decodeFails = false;
-check('a failed decode is still acknowledged', lastAck()?.n === 5, JSON.stringify(lastAck()));
+check('a failed decode is still acknowledged', lastAck()?.n === 6, JSON.stringify(lastAck()));
+check('...and asks for a repaint, since a lost patch cannot self-repair',
+      sent.some((m) => m.t === 'refresh'), JSON.stringify(sent.map((m) => m.t)));
 
 // Acks only ever move forwards.
-const ns = acks().map((m) => m.n);
+const ns = acks().map((m) => m.n);   // note: sent[] was cleared above, so this is the tail
 check('the ack total never goes backwards',
       ns.every((n, i) => i === 0 || n >= ns[i - 1]), `[${ns}]`);
 

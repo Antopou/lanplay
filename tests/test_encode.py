@@ -9,7 +9,7 @@ import pathlib as _p, sys
 sys.path.insert(0, str(_p.Path(__file__).resolve().parent.parent / "host"))
 
 import numpy as np, cv2
-from encode import FrameEncoder
+from encode import FrameEncoder, FRAME, TILE
 
 ok = True
 def check(label, cond, detail=""):
@@ -23,8 +23,20 @@ def screen(h=1080, w=1920, seed=0):
     f[:, :, :3] = rng.integers(0, 255, (h, w, 3), dtype=np.uint8)
     return f
 
+def unpack(payload):
+    """[(x, y, w, h, jpeg), ...] plus the stream size the frame header declares."""
+    count, sw, sh = FRAME.unpack_from(payload, 0)
+    tiles, at = [], FRAME.size
+    for _ in range(count):
+        x, y, w, h, n = TILE.unpack_from(payload, at)
+        at += TILE.size
+        tiles.append((x, y, w, h, payload[at : at + n]))
+        at += n
+    assert at == len(payload), f"{at} != {len(payload)}: tile lengths do not tile the payload"
+    return (sw, sh), tiles
+
 def dims(payload):
-    return struct.unpack("<HHHH", payload[:8])[2:]
+    return unpack(payload)[0]
 
 # --- the idle path ---------------------------------------------------------
 e = FrameEncoder(quality=65, target_height=900)
@@ -46,9 +58,12 @@ check("configure() triggers a resend", e.encode(b) is not None)
 # --- geometry --------------------------------------------------------------
 e = FrameEncoder(quality=65, target_height=900)
 p = e.encode(screen(1080, 1920))
-img = cv2.imdecode(np.frombuffer(p[8:], np.uint8), cv2.IMREAD_COLOR)
-check("1080p downscales to 900p keeping aspect", dims(p) == (1600, 900), str(dims(p)))
-check("header matches the actual JPEG", (img.shape[1], img.shape[0]) == dims(p),
+size, tiles = unpack(p)
+img = cv2.imdecode(np.frombuffer(tiles[0][4], np.uint8), cv2.IMREAD_COLOR)
+check("1080p downscales to 900p keeping aspect", size == (1600, 900), str(size))
+check("the first frame is one whole-screen tile",
+      len(tiles) == 1 and tiles[0][:4] == (0, 0, 1600, 900), str(tiles[0][:4]))
+check("header matches the actual JPEG", (img.shape[1], img.shape[0]) == size,
       f"{img.shape[1]}x{img.shape[0]}")
 
 e = FrameEncoder(target_height=0)
@@ -73,6 +88,81 @@ e.configure(quality=999)
 check("quality is clamped to a sane maximum", e.quality == 95, str(e.quality))
 e.configure(quality=1)
 check("quality is clamped to a sane minimum", e.quality == 20, str(e.quality))
+
+# --- dirty rectangles ------------------------------------------------------
+# The point of the whole exercise: a text box repaint must not cost a screenful.
+def artwork(h=1080, w=1920):
+    """Something that costs what a real screen costs.
+
+    A flat colour is the wrong yardstick here: JPEG squeezes it to nearly nothing, so
+    a full frame looks cheap and the tiling looks pointless. A visual novel background
+    is smooth painted artwork with detail in it, which is what makes a whole frame
+    expensive and skipping most of it worth doing.
+    """
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    f = np.zeros((h, w, 4), np.uint8)
+    f[:, :, 0] = (120 + 60 * np.sin(xx / 90) + 40 * np.cos(yy / 130)).clip(0, 255)
+    f[:, :, 1] = (110 + 50 * np.sin((xx + yy) / 70)).clip(0, 255)
+    f[:, :, 2] = (130 + 45 * np.cos(xx / 50) * np.sin(yy / 160)).clip(0, 255)
+    return f
+
+e = FrameEncoder(quality=65, target_height=0, diff_stride=8, tile=128)
+base = artwork()
+full = e.encode(base)
+check("the first frame is whole", len(unpack(full)[1]) == 1)
+
+box = base.copy()
+box[800:900, 200:1700, :3] = 255            # a dialogue box repainting
+p = e.encode(box)
+size, tiles = unpack(p)
+covered = sum(w * h for _, _, w, h, _ in tiles)
+check("only the changed band is sent", len(tiles) == 1, f"{len(tiles)} tile(s)")
+check("the rectangle covers the change",
+      tiles[0][0] <= 200 and tiles[0][1] <= 800
+      and tiles[0][0] + tiles[0][2] >= 1700 and tiles[0][1] + tiles[0][3] >= 900,
+      f"{tiles[0][:4]} for 200,800 1500x100")
+check("the rectangle is tile-aligned",
+      all(v % 128 == 0 for v in tiles[0][:2]), str(tiles[0][:4]))
+check("a text box costs a fraction of a full frame", len(p) < len(full) / 4,
+      f"{len(p)/1024:.0f} KB vs {len(full)/1024:.0f} KB full "
+      f"({len(full)/len(p):.1f}x saving)")
+check("it covers far less than the screen", covered < 1920 * 1080 / 4,
+      f"{100*covered/(1920*1080):.0f}% of the screen")
+
+# Two separate changes must not be merged into one screen-sized bounding box.
+two = box.copy()
+two[10:20, 10:20, :3] = 1
+two[1000:1010, 1900:1910, :3] = 1
+p = e.encode(two)
+_, tiles = unpack(p)
+check("distant changes stay separate rectangles", len(tiles) == 2, f"{len(tiles)} tile(s)")
+
+# A tall thin change should merge vertically rather than emit one rect per row.
+e2 = FrameEncoder(quality=65, target_height=0, tile=128)
+e2.encode(base)
+tall = base.copy(); tall[0:1080, 500:520, :3] = 255
+_, tiles = unpack(e2.encode(tall))
+check("a vertical run merges into one rectangle", len(tiles) == 1, f"{len(tiles)} tile(s)")
+
+# Redrawing the same pixels changes nothing, so nothing may be sent.
+check("re-sending identical pixels sends nothing", e2.encode(tall) is None)
+
+# tile=0 opts out entirely.
+e3 = FrameEncoder(quality=65, target_height=0, tile=0)
+e3.encode(base)
+_, tiles = unpack(e3.encode(box))
+check("--tile 0 goes back to whole frames",
+      len(tiles) == 1 and tiles[0][:4] == (0, 0, 1920, 1080), str(tiles[0][:4]))
+
+# Every tile must decode, and land where the header says.
+e4 = FrameEncoder(quality=80, target_height=0, tile=128)
+e4.encode(base)
+_, tiles = unpack(e4.encode(box))
+good = all(
+    (lambda im: im is not None and (im.shape[1], im.shape[0]) == (w, h))(
+        cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR))
+    for _, _, w, h, j in tiles)
+check("every tile decodes at its declared size", good, f"{len(tiles)} tile(s)")
 
 # --- quality has the expected effect ---------------------------------------
 frame = screen(720, 1280, seed=7)

@@ -15,6 +15,20 @@ def check(label, cond, detail=""):
     ok = ok and cond
     print(f"  {'PASS' if cond else 'FAIL'}  {label}" + (f"   {detail}" if detail else ""))
 
+def unpack(data):
+    """[(x, y, w, h, jpeg), ...] plus the stream size, per the frame header."""
+    count, sw, sh = struct.unpack_from("<HHH", data, 0)
+    tiles, at = [], 6
+    for _ in range(count):
+        x, y, w, h, n = struct.unpack_from("<HHHHI", data, at)
+        at += 12
+        tiles.append((x, y, w, h, data[at : at + n]))
+        at += n
+    if at != len(data):
+        raise ValueError(f"tile lengths do not tile the payload: {at} != {len(data)}")
+    return (sw, sh), tiles
+
+
 class Viewer:
     """A socket that acknowledges frames, as viewer.js does.
 
@@ -65,15 +79,20 @@ async def main():
                 msg = await v.recv(5)
                 if msg.type is not aiohttp.WSMsgType.BINARY:
                     continue
-                x, y, w, h = struct.unpack("<HHHH", msg.data[:8])
-                img = cv2.imdecode(np.frombuffer(msg.data[8:], np.uint8), cv2.IMREAD_COLOR)
-                if img is None:
-                    check("JPEG payload decodes", False)
+                (sw, sh), tiles = unpack(msg.data)
+                imgs = [cv2.imdecode(np.frombuffer(j, np.uint8), cv2.IMREAD_COLOR)
+                        for *_, j in tiles]
+                if any(i is None for i in imgs):
+                    check("every tile decodes", False)
                     break
                 if dims is None:
-                    dims = (w, h)
-                    check("header matches decoded JPEG", (img.shape[1], img.shape[0]) == (w, h),
-                          f"{w}x{h}, origin {x},{y}")
+                    dims = (sw, sh)
+                    check("every tile decodes at its declared size",
+                          all((i.shape[1], i.shape[0]) == (w, h)
+                              for i, (_, _, w, h, _) in zip(imgs, tiles)),
+                          f"stream {sw}x{sh}, {len(tiles)} tile(s)")
+                    check("tiles stay inside the stream",
+                          all(x + w <= sw and y + h <= sh for x, y, w, h, _ in tiles))
                 sizes.append(len(msg.data))
             elapsed = time.perf_counter() - t0
             fps = len(sizes) / elapsed
@@ -115,7 +134,7 @@ async def main():
             while time.perf_counter() - t0 < 3:
                 msg = await v.recv(3)
                 if msg.type is aiohttp.WSMsgType.BINARY:
-                    newdims = struct.unpack("<HHHH", msg.data[:8])[2:]
+                    newdims = unpack(msg.data)[0]
                     break
             check("session survives malformed input", newdims is not None)
             check("cfg resizes the stream", newdims == (1280, 720), f"{dims} -> {newdims}")

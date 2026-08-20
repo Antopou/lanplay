@@ -31,13 +31,24 @@ const unstyled = [...toggled].filter(c => !css.includes('.' + c));
 check('every class the JS toggles is styled', unstyled.length === 0,
       `[${[...toggled]}] -> unstyled: [${unstyled}]`);
 
-// The two halves of the wire format must agree.
-check('encode.py packs the header as <HHHH', py.includes('struct.Struct("<HHHH")'));
-const offsets = [...js.matchAll(/head\.getUint16\((\d+), true\)/g)].map(m => Number(m[1]));
-check('viewer.js reads four little-endian u16 at 0,2,4,6',
-      JSON.stringify(offsets) === '[0,2,4,6]', `[${offsets}]`);
-check('viewer.js skips exactly the 8 header bytes', js.includes('buf.slice(8)'));
-check('the DataView is bounded to the header', js.includes('new DataView(buf, 0, 8)'));
+// The two halves of the wire format must agree. Nothing at runtime checks this --
+// a mismatch just draws garbage -- so it is pinned down here.
+check('encode.py packs a <HHH frame header', py.includes('FRAME = struct.Struct("<HHH")'));
+check('encode.py packs a <HHHHI tile header', py.includes('TILE = struct.Struct("<HHHHI")'));
+
+const frameOffsets = [...js.matchAll(/head\.getUint16\((\d+), true\)/g)].map(m => Number(m[1]));
+check('viewer.js reads count, w, h at 0,2,4',
+      JSON.stringify(frameOffsets) === '[0,2,4]', `[${frameOffsets}]`);
+
+// <HHH is 6 bytes, so tiles start there; <HHHHI is 12, with the u32 length at +8.
+check('viewer.js starts the tile walk after the 6-byte frame header',
+      /\bat = 6\b/.test(js));
+check('viewer.js reads the tile length as a u32 at +8',
+      js.includes('t.getUint32(8, true)'));
+check('viewer.js bounds each tile DataView to its 12-byte header',
+      js.includes('new DataView(buf, at, 12)'));
+check('viewer.js advances by header plus payload',
+      /at \+= 12 \+ len/.test(js));
 
 // Message types the client emits must all be handled by the server.
 const server = readFileSync(`${dir}/server.py`, 'utf8');

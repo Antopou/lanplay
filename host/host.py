@@ -102,6 +102,8 @@ def main() -> None:
                         help="resend an unchanged screen this often, seconds")
     parser.add_argument("--diff-stride", type=int, default=8,
                         help="change-detection sampling grid; smaller catches more, costs more")
+    parser.add_argument("--tile", type=int, default=128,
+                        help="dirty-rectangle grid in pixels; 0 sends whole frames")
     parser.add_argument("--win-key", action="store_true",
                         help="send Cmd as the Windows key rather than as Ctrl")
     args = parser.parse_args()
@@ -140,6 +142,7 @@ def main() -> None:
         quality=args.quality,
         target_height=args.height,
         diff_stride=max(1, args.diff_stride),
+        tile=args.tile,
     )
 
     source = f"{capture.width}x{capture.height}"

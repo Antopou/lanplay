@@ -85,6 +85,18 @@ A 40× difference, and the reason this works without a video codec. Idle is not
 literally zero only because of the periodic refresh (one frame every `--refresh`
 seconds, 2 by default); raise that and it goes to nothing.
 
+Dirty rectangles then take most of what is left. Measured against `--fake` at 720p
+quality 65, which is a *harsher* test than a visual novel — a box sweeping across the
+whole screen with a ticking clock, so a good deal is dirty every frame:
+
+| | frames/sec | bandwidth | per frame |
+|---|---|---|---|
+| `--tile 0`, whole frames | 31.0 | 774 KB/s | 25 KB |
+| `--tile 128`, dirty rectangles | 30.8 | **170 KB/s** | 6 KB |
+
+**4.6× for free**, at the same framerate. A real visual novel does better than this,
+because the artwork behind the text box genuinely does not move.
+
 Per-frame CPU cost:
 
 | | |
@@ -106,7 +118,12 @@ times the bytes, and a visual novel stays perfectly readable at 720p.
 uv run host\host.py --height 720 --quality 55      # lighter
 uv run host\host.py --height 0 --quality 85        # native resolution, sharper
 uv run host\host.py --fps 15                       # visual novels rarely need more
+uv run host\host.py --tile 64                      # finer dirty rectangles
+uv run host\host.py --tile 0                       # whole frames, to compare against
 ```
+
+`--tile 0` is worth knowing about: it turns the dirty-rectangle path off, so you can
+measure what it is actually saving you on your own content.
 
 `--help` lists the rest.
 
@@ -137,12 +154,23 @@ resends more often.
 
 The host grabs the screen 30×/sec and, before doing anything expensive, checks
 whether it differs from the previous frame at all. Usually it does not, and nothing
-is sent. When it does, the frame is downscaled, JPEG-encoded, and pushed over a
-WebSocket as an 8-byte header plus the JPEG.
+is sent. When it does, the frame is downscaled and diffed a second time on a grid of
+128px tiles, and only the rectangles that actually changed are JPEG-encoded and
+pushed over a WebSocket:
+
+```
+[u16 count][u16 stream_w][u16 stream_h]
+count ×  [u16 x][u16 y][u16 w][u16 h][u32 len][ …JPEG… ]
+```
+
+Adjacent dirty tiles are merged into runs before encoding, because every JPEG carries
+its own ~600 bytes of Huffman tables — a hundred loose tiles would spend more on
+headers than a whole frame costs in pixels. A repainting text box comes out of this
+as a single rectangle.
 
 That is why there is no H.264, no WebRTC, no hardware encoder — a visual novel is a
 static picture most of the time, so the compression that matters is *not sending
-anything*.
+anything*, and the second-best is not sending the nine tenths that did not move.
 
 Capture and encoding run on their own thread. The event loop only sees a single
 "latest frame" slot, never a queue, so a viewer that falls behind skips frames and
@@ -161,7 +189,7 @@ before it, what goes out is always the newest one.
 |---|---|
 | `host/host.py` | entry point, DPI fix, PIN, banner |
 | `host/capture.py` | screen → BGRA (and the `--fake` synthetic screen) |
-| `host/encode.py` | change detection, downscale, JPEG |
+| `host/encode.py` | change detection, downscale, dirty rectangles, JPEG |
 | `host/inputs.py` | `event.code` → Windows keys, pointer injection |
 | `host/server.py` | HTTP + WebSocket, capture thread, frame hub |
 | `host/static/` | the viewer page |
@@ -207,10 +235,12 @@ is small enough to read and change.
 
 Natural next steps, roughly in order of payoff:
 
-1. **Tile dirty-rects** — send only the 128px tiles that changed. For a visual novel
-   where just the text box repaints, roughly a 10× bandwidth cut. `encode.py` only;
-   the viewer already draws each payload at its stated offset.
-2. **`dxcam` backend** — Desktop Duplication instead of GDI: faster, near-zero CPU,
-   and it can see exclusive-fullscreen games.
+1. **`dxcam` backend** — Desktop Duplication instead of GDI: faster, near-zero CPU,
+   and it can see exclusive-fullscreen games. The biggest remaining win if the host
+   is the bottleneck rather than the network.
+2. **Quality that adapts to motion** — encode at a lower quality while the screen is
+   changing and send one sharp frame once it settles. Roughly halves the peak bitrate,
+   and covers the case tiles cannot help with: a scene transition, where everything
+   is dirty at once.
 3. **Audio** — WASAPI loopback via `pyaudiowpatch` on a second WebSocket. Much the
    hardest of the three.

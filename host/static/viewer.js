@@ -2,9 +2,15 @@
 
 /* LANplay viewer.
  *
- * Frames arrive as binary: an 8-byte little-endian header [x][y][w][h] followed by
- * a JPEG. v1 only ever sends whole frames, but drawing each payload at its stated
- * offset means the tile/dirty-rect upgrade needs no change here at all.
+ * Frames arrive as one binary message per update, little-endian:
+ *
+ *     [u16 count][u16 stream_w][u16 stream_h]
+ *     count x:  [u16 x][u16 y][u16 w][u16 h][u32 len][ ...JPEG... ]
+ *
+ * Usually only the rectangles that actually changed are present -- a repainting
+ * text box is one of them -- so most updates are a fraction of a screenful. The
+ * canvas keeps everything that was not resent, and the host re-sends the whole
+ * screen every --refresh seconds, which is what makes a missed tile self-correct.
  *
  * Input goes back as small JSON messages. Coordinates are normalized 0..1 against
  * the canvas's on-screen rectangle, so window resizing, letterboxing and Retina
@@ -38,7 +44,12 @@ let capturing = false;
 let retry = null;
 
 let frames = 0, bytes = 0, rtt = 0;
-let decoding = false, pendingFrame = null, received = 0;
+let decoding = false, received = 0;
+// A queue, where full frames only needed a latest-only slot: updates are now
+// incremental, so a dropped one leaves stale pixels until the next refresh. It
+// cannot grow -- the host will not send more than a couple of unacknowledged
+// updates, which is what bounds this.
+const queue = [];
 let pendingMove = null, wheelX = 0, wheelY = 0;
 const held = new Set();
 
@@ -67,8 +78,8 @@ function connect(candidate) {
 function onMessage(ev) {
   if (typeof ev.data !== 'string') {
     bytes += ev.data.byteLength;
-    received++;                         // counted on arrival, so a frame we skip
-    pendingFrame = ev.data;             // below still returns its credit
+    received++;
+    queue.push(ev.data);
 
     if (!decoding) pump();
     return;
@@ -114,34 +125,51 @@ function showGate(message, isError) {
 async function pump() {
   decoding = true;
   try {
-    while (pendingFrame) {
-      const buf = pendingFrame;
-      pendingFrame = null;
+    while (queue.length) {
+      const buf = queue.shift();
 
-      const head = new DataView(buf, 0, 8);
-      const x = head.getUint16(0, true);
-      const y = head.getUint16(2, true);
-      const w = head.getUint16(4, true);
-      const h = head.getUint16(6, true);
+      const head = new DataView(buf);
+      const count = head.getUint16(0, true);
+      const sw = head.getUint16(2, true);
+      const sh = head.getUint16(4, true);
 
-      const bmp = await createImageBitmap(new Blob([buf.slice(8)], { type: 'image/jpeg' }));
-      // A full frame states the stream's current size, so a quality/scale change on
-      // the host resizes the canvas here without needing its own message.
-      if (x === 0 && y === 0 && (cv.width !== w || cv.height !== h)) {
-        cv.width = w;
-        cv.height = h;
+      // Every frame states the stream size, so a quality/scale change on the host
+      // resizes the canvas here without needing its own message. Resizing also
+      // clears the canvas, so ask for a full frame rather than painting tiles of
+      // the new size over a blank background.
+      if (cv.width !== sw || cv.height !== sh) {
+        cv.width = sw;
+        cv.height = sh;
+        if (count > 1) { send({ t: 'refresh' }); }
       }
-      ctx.drawImage(bmp, x, y);
-      bmp.close();
+
+      // Decode every tile before drawing any: a tile drawn while a later one is
+      // still decoding would let the screen show half of two different updates.
+      let at = 6;
+      const parts = [];
+      for (let i = 0; i < count; i++) {
+        const t = new DataView(buf, at, 12);
+        const len = t.getUint32(8, true);
+        parts.push({
+          x: t.getUint16(0, true), y: t.getUint16(2, true),
+          blob: new Blob([new Uint8Array(buf, at + 12, len)], { type: 'image/jpeg' }),
+        });
+        at += 12 + len;
+      }
+      const bitmaps = await Promise.all(parts.map((t) => createImageBitmap(t.blob)));
+      bitmaps.forEach((bmp, i) => { ctx.drawImage(bmp, parts[i].x, parts[i].y); bmp.close(); });
       frames++;
     }
   } catch (err) {
     console.warn('frame decode failed', err);
+    queue.length = 0;
+    send({ t: 'refresh' });
   } finally {
     decoding = false;
     // Nothing can arrive between the loop's last check and here -- no await lies
     // between them -- so this total is exactly what is on screen. Sent even after
-    // a decode failure: a dropped frame must not cost the host a credit forever.
+    // a decode failure: a dropped update must not cost the host a credit forever,
+    // and the refresh requested above repairs whatever it was carrying.
     send({ t: 'ack', n: received });
   }
 }
