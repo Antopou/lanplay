@@ -302,6 +302,22 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def static_file(request: web.Request) -> web.FileResponse:
+    """Serve the viewer, uncached.
+
+    add_static leaves caching to Chrome's heuristics, which is how you end up running
+    a viewer.js from before a protocol change against a host from after it -- here
+    that meant a viewer that could not acknowledge frames, so the host quietly gave up
+    pacing it and the fix looked like it had done nothing. Not worth the round trip
+    saved on a LAN.
+    """
+    name = request.match_info["name"]
+    path = (STATIC / name).resolve()
+    if path.parent != STATIC or not path.is_file():   # no ../ escapes
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "no-store"})
+
+
 async def index(request: web.Request) -> web.FileResponse:
     return web.FileResponse(
         STATIC / "index.html",
@@ -330,7 +346,7 @@ def serve(*, capture, encoder, injector, pin: str, port: int, fps: int, refresh:
 
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
-    app.router.add_static("/static/", STATIC)
+    app.router.add_get("/static/{name}", static_file)
 
     async def on_startup(_: web.Application) -> None:
         hub.bind(asyncio.get_running_loop())
