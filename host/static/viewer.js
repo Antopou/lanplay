@@ -9,6 +9,11 @@
  * Input goes back as small JSON messages. Coordinates are normalized 0..1 against
  * the canvas's on-screen rectangle, so window resizing, letterboxing and Retina
  * scaling cannot pull the remote pointer out of sync with yours.
+ *
+ * We also acknowledge frames. The host will not commit more than a couple to the
+ * wire until we say we have drawn them, which stops a saturated link from filling
+ * its socket and driver buffers with picture that is already out of date -- the
+ * reason a stream can be a second behind while keystrokes stay instant.
  */
 
 const cv = document.getElementById('screen');
@@ -33,7 +38,7 @@ let capturing = false;
 let retry = null;
 
 let frames = 0, bytes = 0, rtt = 0;
-let decoding = false, pendingFrame = null;
+let decoding = false, pendingFrame = null, received = 0;
 let pendingMove = null, wheelX = 0, wheelY = 0;
 const held = new Set();
 
@@ -46,6 +51,7 @@ const setDot = (state) => { dot.className = state; };
 function connect(candidate) {
   clearTimeout(retry);
   pin = candidate;
+  received = 0;
   setDot('wait');
   hud.textContent = 'connecting';
 
@@ -61,7 +67,9 @@ function connect(candidate) {
 function onMessage(ev) {
   if (typeof ev.data !== 'string') {
     bytes += ev.data.byteLength;
-    pendingFrame = ev.data;             // only the newest one is worth decoding
+    received++;                         // counted on arrival, so a frame we skip
+    pendingFrame = ev.data;             // below still returns its credit
+
     if (!decoding) pump();
     return;
   }
@@ -131,6 +139,10 @@ async function pump() {
     console.warn('frame decode failed', err);
   } finally {
     decoding = false;
+    // Nothing can arrive between the loop's last check and here -- no await lies
+    // between them -- so this total is exactly what is on screen. Sent even after
+    // a decode failure: a dropped frame must not cost the host a credit forever.
+    send({ t: 'ack', n: received });
   }
 }
 

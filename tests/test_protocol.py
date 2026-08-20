@@ -15,6 +15,25 @@ def check(label, cond, detail=""):
     ok = ok and cond
     print(f"  {'PASS' if cond else 'FAIL'}  {label}" + (f"   {detail}" if detail else ""))
 
+class Viewer:
+    """A socket that acknowledges frames, as viewer.js does.
+
+    The host will not keep more than a couple of frames on the wire until they are
+    acked, so a test that reads without acking stalls after two -- which is the point
+    of the mechanism, and is checked directly further down.
+    """
+
+    def __init__(self, ws):
+        self.ws, self.n = ws, 0
+
+    async def recv(self, timeout=5):
+        msg = await asyncio.wait_for(self.ws.receive(), timeout=timeout)
+        if msg.type is aiohttp.WSMsgType.BINARY:
+            self.n += 1
+            await self.ws.send_json({"t": "ack", "n": self.n})
+        return msg
+
+
 async def main():
     async with aiohttp.ClientSession() as s:
         # --- wrong PIN must be refused --------------------------------------
@@ -34,7 +53,8 @@ async def main():
         # --- correct PIN ----------------------------------------------------
         async with s.ws_connect(URL) as ws:
             await ws.send_json({"t": "auth", "pin": PIN})
-            msg = await asyncio.wait_for(ws.receive(), timeout=5)
+            v = Viewer(ws)
+            msg = await v.recv(5)
             ready = json.loads(msg.data) if msg.type is aiohttp.WSMsgType.TEXT else {}
             check("handshake returns ready", ready.get("t") == "ready",
                   f"screen {ready.get('w')}x{ready.get('h')}")
@@ -42,7 +62,7 @@ async def main():
             # --- frames -----------------------------------------------------
             sizes, dims, t0 = [], None, time.perf_counter()
             while len(sizes) < 45 and time.perf_counter() - t0 < 6:
-                msg = await asyncio.wait_for(ws.receive(), timeout=5)
+                msg = await v.recv(5)
                 if msg.type is not aiohttp.WSMsgType.BINARY:
                     continue
                 x, y, w, h = struct.unpack("<HHHH", msg.data[:8])
@@ -66,7 +86,7 @@ async def main():
             await ws.send_json({"t": "ping", "ts": 1234.5})
             pong = None
             while time.perf_counter() - sent < 3:
-                msg = await asyncio.wait_for(ws.receive(), timeout=3)
+                msg = await v.recv(3)
                 if msg.type is aiohttp.WSMsgType.TEXT:
                     pong = json.loads(msg.data)
                     break
@@ -93,12 +113,43 @@ async def main():
             newdims = None
             t0 = time.perf_counter()
             while time.perf_counter() - t0 < 3:
-                msg = await asyncio.wait_for(ws.receive(), timeout=3)
+                msg = await v.recv(3)
                 if msg.type is aiohttp.WSMsgType.BINARY:
                     newdims = struct.unpack("<HHHH", msg.data[:8])[2:]
                     break
             check("session survives malformed input", newdims is not None)
             check("cfg resizes the stream", newdims == (1280, 720), f"{dims} -> {newdims}")
+
+        # --- pacing: frames must stop until they are acknowledged -------
+        # The whole point of the ack: without it the host commits frames to a socket
+        # buffer the application cannot see, and a saturated link shows picture that
+        # is already hundreds of milliseconds old.
+        async with s.ws_connect(URL) as ws:
+            await ws.send_json({"t": "auth", "pin": PIN})
+            await asyncio.wait_for(ws.receive(), timeout=5)      # ready
+
+            # Read without acking. Stay under the host's stall timeout, or it decides
+            # we are an old viewer that cannot ack and gives up pacing us.
+            burst, t0 = 0, time.perf_counter()
+            while (left := 0.6 - (time.perf_counter() - t0)) > 0:
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=left)
+                except asyncio.TimeoutError:
+                    break
+                if msg.type is aiohttp.WSMsgType.BINARY:
+                    burst += 1
+            check("un-acked frames stop at the in-flight limit", 1 <= burst <= 2,
+                  f"{burst} frames in 0.6s (unpaced would be ~18)")
+
+            # ...and acknowledging them starts it flowing again.
+            await ws.send_json({"t": "ack", "n": burst})
+            resumed, t0 = 0, time.perf_counter()
+            while resumed < 5 and time.perf_counter() - t0 < 3:
+                msg = await asyncio.wait_for(ws.receive(), timeout=3)
+                if msg.type is aiohttp.WSMsgType.BINARY:
+                    resumed += 1
+                    await ws.send_json({"t": "ack", "n": burst + resumed})
+            check("acknowledging resumes the stream", resumed >= 5, f"{resumed} frames")
 
         # --- two viewers at once ----------------------------------------
         # FrameHub fans one encoded frame out to every waiter; nothing else
@@ -106,9 +157,10 @@ async def main():
         async def watch(label):
             async with s.ws_connect(URL) as w:
                 await w.send_json({"t": "auth", "pin": PIN})
+                v2 = Viewer(w)
                 got, t0 = 0, time.perf_counter()
                 while got < 10 and time.perf_counter() - t0 < 6:
-                    msg = await asyncio.wait_for(w.receive(), timeout=5)
+                    msg = await v2.recv(5)
                     if msg.type is aiohttp.WSMsgType.BINARY:
                         got += 1
                 return got

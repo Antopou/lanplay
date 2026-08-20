@@ -148,6 +148,15 @@ Capture and encoding run on their own thread. The event loop only sees a single
 "latest frame" slot, never a queue, so a viewer that falls behind skips frames and
 stays current instead of drifting further into the past.
 
+That slot alone is not enough, because a frame handed to the socket is not a frame on
+the wire -- it sits in the send buffer and the WiFi driver's queue, a few hundred KB
+of picture the program cannot see. On a saturated link that buffer *is* the lag, and
+it is why a stream can run most of a second behind while keystrokes stay instant. So
+the viewer acknowledges each frame once it has drawn it, and the host will not commit
+more than two unacknowledged frames at a time. The stream then clocks itself to the
+real speed of the link, and because the frame is chosen after that wait rather than
+before it, what goes out is always the newest one.
+
 | file | |
 |---|---|
 | `host/host.py` | entry point, DPI fix, PIN, banner |
@@ -173,6 +182,7 @@ uv run tests/test_encode.py       # change detection, scaling, the wire header
 uv run tests/test_capture.py      # BGRA parsing, without touching the real screen
 uv run tests/test_keys.py         # key map, checked against pynput's Windows backend
 node tests/test_viewer.mjs        # viewer/server consistency, static
+node tests/test_viewer_ack.mjs    # runs viewer.js on a stub DOM: frame acks
 ```
 
 And end-to-end, against a running host, on either machine:

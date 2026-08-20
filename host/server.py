@@ -5,10 +5,18 @@ cv2.imencode is ~5ms of solid CPU per frame; run that on the loop and every send
 to every viewer stalls behind it. The thread hands finished frames to the loop
 through FrameHub.
 
-FrameHub is also where lag is prevented. It is a *slot*, not a queue: it holds only
-the most recent frame. A viewer that cannot keep up therefore skips frames and stays
-current, instead of accumulating a backlog and drifting further behind real time --
-which is the usual way a homemade screen streamer ends up feeling terrible.
+FrameHub is the first half of how lag is prevented. It is a *slot*, not a queue: it
+holds only the most recent frame. A viewer that cannot keep up therefore skips frames
+and stays current, instead of accumulating a backlog and drifting further behind real
+time -- which is the usual way a homemade screen streamer ends up feeling terrible.
+
+FramePacer is the other half, and it covers what the hub cannot see. `send_bytes`
+returns once a frame is in aiohttp's transport buffer; behind that sit the kernel send
+buffer and the WiFi driver queue, together a few hundred KB of already-committed
+picture. On a saturated link that is most of the perceived lag -- keystrokes stay
+instant, because they are 50 bytes going the other way, while the screen runs most of
+a second behind. So the viewer acknowledges each frame it has drawn and the pacer
+holds the next one until the link has actually drained.
 """
 
 from __future__ import annotations
@@ -69,6 +77,53 @@ class FrameHub:
             if self._seq == last_seq:
                 return last_seq, None
             return self._seq, self._payload
+
+
+class FramePacer:
+    """Bounds how many frames may be in flight to one viewer at a time.
+
+    One of these per connection, so a viewer on a weak link paces itself without
+    slowing anyone else down.
+
+    The count is a running total rather than a per-frame id, which keeps the 8-byte
+    wire header free and makes a single missed acknowledgement self-correcting: the
+    next one carries the true total and the credit comes straight back.
+    """
+
+    STALL = 1.0   # seconds of silence before we assume the viewer never acks at all
+
+    def __init__(self, limit: int = 2) -> None:
+        self.limit = limit
+        self.sent = 0
+        self.acked = 0
+        self.paced = True
+        self._room = asyncio.Event()
+        self._room.set()
+
+    async def room(self, remote: str) -> None:
+        """Block until the viewer is near enough to current to be sent another frame."""
+        if not self.paced:
+            return
+        try:
+            await asyncio.wait_for(self._room.wait(), timeout=self.STALL)
+        except asyncio.TimeoutError:
+            # Almost always a viewer.js cached from before acks existed. Falling back
+            # to firehosing it is worse than this was, but it beats a frozen screen.
+            print(f"! viewer at {remote} never acknowledged a frame; pacing it off")
+            self.paced = False
+            self._room.set()
+
+    def sending(self) -> None:
+        self.sent += 1
+        if self.paced and self.sent - self.acked >= self.limit:
+            self._room.clear()
+
+    def ack(self, drawn: int) -> None:
+        # Clamped both ways: acks never go backwards, and a viewer cannot claim to
+        # have drawn frames we never sent it.
+        self.acked = max(self.acked, min(drawn, self.sent))
+        if self.sent - self.acked < self.limit:
+            self._room.set()
 
 
 def capture_loop(capture, encoder, hub: FrameHub, fps: int, refresh: float, stop: threading.Event) -> None:
@@ -140,18 +195,24 @@ async def _authenticate(ws: web.WebSocketResponse, pin: str, remote: str) -> boo
     return True
 
 
-async def _send_frames(ws: web.WebSocketResponse, hub: FrameHub) -> None:
+async def _send_frames(
+    ws: web.WebSocketResponse, hub: FrameHub, pacer: FramePacer, remote: str
+) -> None:
     event = hub.subscribe()
     seq = 0
     try:
         while not ws.closed:
             await event.wait()
             event.clear()
+            # Wait for room *before* choosing the frame, not after. The hub keeps
+            # replacing its slot while we are blocked here, so what finally goes out
+            # is the newest frame that exists at that moment rather than whichever
+            # one happened to be current when we woke up.
+            await pacer.room(remote)
             seq, payload = hub.take(seq)
             if payload is None:
                 continue
-            # While this await is in flight the hub keeps replacing its slot, so a
-            # slow viewer simply misses those frames rather than queueing them.
+            pacer.sending()
             await ws.send_bytes(payload)
     except (ConnectionResetError, asyncio.CancelledError):
         pass
@@ -159,7 +220,9 @@ async def _send_frames(ws: web.WebSocketResponse, hub: FrameHub) -> None:
         hub.unsubscribe(event)
 
 
-async def _handle_input(data: dict, injector, encoder, ws: web.WebSocketResponse) -> None:
+async def _handle_input(
+    data: dict, injector, encoder, pacer: FramePacer, ws: web.WebSocketResponse
+) -> None:
     kind = data.get("t")
 
     if kind == "m":
@@ -187,6 +250,9 @@ async def _handle_input(data: dict, injector, encoder, ws: web.WebSocketResponse
         if "meta" in data:
             injector.meta_as_ctrl = bool(data["meta"])
 
+    elif kind == "ack":
+        pacer.ack(int(data.get("n", 0)))
+
     elif kind == "ping":
         await ws.send_json({"t": "pong", "ts": data.get("ts")})
 
@@ -209,13 +275,16 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     app["clients"] += 1
     print(f"+ viewer connected from {remote}  ({app['clients']} watching)")
 
-    sender = asyncio.create_task(_send_frames(ws, app["hub"]))
+    pacer = FramePacer()
+    sender = asyncio.create_task(_send_frames(ws, app["hub"], pacer, remote))
     try:
         async for msg in ws:
             if msg.type is not WSMsgType.TEXT:
                 continue
             try:
-                await _handle_input(json.loads(msg.data), app["injector"], app["encoder"], ws)
+                await _handle_input(
+                    json.loads(msg.data), app["injector"], app["encoder"], pacer, ws
+                )
             except Exception as exc:
                 print(f"! ignoring bad input message: {exc}")
     finally:
